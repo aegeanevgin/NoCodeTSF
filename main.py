@@ -9,9 +9,16 @@ from sklearn.metrics import accuracy_score, mean_squared_error
 from sklearn.preprocessing import OneHotEncoder, LabelEncoder
 from sklearn.feature_extraction.text import CountVectorizer
 from statsmodels.tsa.arima.model import ARIMA
+from pmdarima import auto_arima
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM
 import itertools
 import numpy as np
 import warnings
+import plotly.graph_objects as go
+#from fbprophet import Prophet
 warnings.filterwarnings("ignore")
 
 
@@ -75,12 +82,114 @@ def encode_features(df, cates, encods):
     return df_encoded, label_encoders, onehot_encoders, count_vectorizers
 
 
-def prophet_train(df):
+def split_timestamp(df, label=None):
+  """ Splits the datetime timestamp into hour-day-month-year. """
+  df = df.copy()
+  df['Date'] = df.index
+  df['Hour'] = df['Date'].dt.hour
+  df['DayofWeek'] = df['Date'].dt.dayofweek
+  df['Quarter'] = df['Date'].dt.quarter
+  df['Month'] = df['Date'].dt.month
+  df['Year'] = df['Date'].dt.year
+  df['Dayofyear'] = df['Date'].dt.dayofyear
+  df['DayofMonth'] = df['Date'].dt.day
+  df['WeekofYear'] = df['Date'].dt.weekofyear
+  X = df[
+    ['Hour','DayofWeek','Quarter','Month','Year',
+     'DayofYear','DayofMonth','WeekofYear']
+  ]
+  if label:
+    y = df[label]
+    return X, y
+  return X
+
+
+def prophet_train(df, target_col, train_size, order=(1, 1, 1)):
+  """ Trains a prophet model and applies the forecasting. """
+  df = pd.read_csv('PJME_hourly.csv',index_col=[0], parse_dates=[0])
   st.write("Prophet Training has begun.")
+  X, y = split_timestamp(df, label='PJME_MW')
+  features_and_target = pd.concat([X, y], axis=1)
+  split_date = '01-Jan-2015'
+  df_train = df.loc[df.index <= split_date].copy()
+  df_test = df.loc[df.index > split_date].copy()
+  # Prophet model expects the DataFrame to be named this way
+  df_train.reset_index().rename(columns={'Datetime':'ds','PJME_MW':'y'})
+  model = Prophet()
+  model.fit(
+    df_train.reset_index().rename(columns={'Datetime':'ds','PJME_MW':'y'})
+  )
+  df_test_fcst = model.predict(
+    df=df_test.reset_index().rename(columns={'Datetime':'ds'})
+  )
+  print("Prophet Forecasting Finished: ", df_test_fcst.head())
+  """
+  f, ax = plt.subplots(1)
+  f.set_figheight(5)
+  f.set_figwidth(15)
+  ax.scatter(df_test.index, df_test['PJME_MW'], color='r')
+  fig = model.plot(df_test_fcst, ax=ax)
+  """
+  fig = go.Figure()
+  fig.add_trace(
+    go.Scatter(
+      x=df_test['ds'], y=df_test['y'], mode='markers', name='Actual',
+      marker=dict(color='red')
+    )
+  )
+  fig.add_trace(
+    go.Scatter(
+      x=df_test_fcst['ds'], y=df_test_fcst['yhat'], mode='lines',
+      name='Forecast', line=dict(color='blue')
+    )
+  )
+  fig.update_layout(
+    title='Actual vs Forecast', xaxis_title='Datetime',
+    yaxis_title=target_col, height=600, width=1000
+  )
+  st.plotly_chart(fig)
 
 
-def auto_arima_train(df):
+def auto_arima_train(df, target_col, train_size):
+  """ Trains an Auto ARIMA model with no need to manually pick p-d-q values."""
   st.write("Auto ARIMA Training has begun.")
+  train_size = int(len(df) * train_size)
+  train, test = df[target_col][:train_size], df[target_col][train_size:]
+  model = auto_arima(
+    train, seasonal=True, m=8760, stepwise=True, suppress_warnings=True
+  )
+  st.write(model.summary())
+  forecast = model.predict(n_periods=len(test))
+  forecast_index = test.index
+  forecast_series = pd.Series(forecast, index=forecast_index)
+  rmse = np.sqrt(mean_squared_error(test, forecast))
+  st.write(f"Root Mean Squared Error: {rmse}")
+  st.write("Test data:")
+  st.write(test.head())
+  st.write("Forecast data:")
+  st.write(forecast_series.head())
+  fig = go.Figure()
+  fig.add_trace(
+    go.Scatter(
+      x=test.index, y=test, mode='markers', name='Actual',
+      marker=dict(color='red')
+    )
+  )
+  fig.add_trace(
+    go.Scatter(
+      x=forecast_series.index, y=forecast_series, 
+      mode='lines', name='Forecast', line=dict(color='blue')
+    )
+  )
+  fig.update_layout(
+    title='Actual vs Forecast',
+    xaxis_title='Datetime',
+    yaxis_title=target_col,
+    height=600,
+    width=1000
+  )
+  st.plotly_chart(fig)
+  return model
 
 
 def optimize_pdq(y, p_range, d_range, q_range):
@@ -103,9 +212,9 @@ def optimize_pdq(y, p_range, d_range, q_range):
         best_aic = results.aic
         best_pdq = param
     except:
-      continue
-            
+      continue 
   return best_pdq
+
 
 def arima_train(df, target_col, train_size, order=(1, 1, 1)):
   st.write("ARIMA Training has begun.")
@@ -117,18 +226,103 @@ def arima_train(df, target_col, train_size, order=(1, 1, 1)):
   forecast = model_fit.forecast(steps=len(test))
   forecast_index = test.index
   forecast_series = pd.Series(forecast, index=forecast_index)
-  
   rmse = np.sqrt(mean_squared_error(test, forecast))
   st.write(f"Root Mean Squared Error: {rmse}")
+  """
   st.line_chart(pd.DataFrame({
     "Actual": test,
     "Forecast": forecast_series
   }))
+  """
+  fig = go.Figure()
+  fig.add_trace(go.Scatter(x=test.index, y=test, mode='markers', name='Actual', marker=dict(color='red')))
+  fig.add_trace(go.Scatter(x=forecast_series.index, y=forecast_series, mode='lines', name='Forecast', line=dict(color='blue')))
+  fig.update_layout(
+    title='Actual vs Forecast',
+    xaxis_title='Datetime',
+    yaxis_title=target_col,
+    height=600,
+    width=1000
+  )
+  st.plotly_chart(fig)
   return model_fit
 
 
-def lstm_train(df):
+def prepare_dataset_lstm(dataset, time_steps=1):
+  X, y = [], []
+  for i in range(len(dataset) - time_steps):
+    X.append(dataset[i:(i + time_steps), 0])
+    y.append(dataset[i + time_steps, 0])
+  return np.array(X), np.array(y)
+
+def lstm_train(df, target_col, train_size):
   st.write("LSTM Training has begun.")
+  scaler = MinMaxScaler(feature_range=(0, 1))
+  scaled_data = scaler.fit_transform(df[target_col].values.reshape(-1, 1))
+  train_size = int(len(scaled_data) * train_size)
+  train, test = scaled_data[:train_size], scaled_data[train_size:]
+  time_steps = 1
+  X_train, y_train = prepare_dataset_lstm(train, time_steps)
+  X_test, y_test = prepare_dataset_lstm(test, time_steps)
+  # Reshape input to be [samples, time steps, features]
+  X_train = np.reshape(X_train, (X_train.shape[0], 1, X_train.shape[1]))
+  X_test = np.reshape(X_test, (X_test.shape[0], 1, X_test.shape[1]))
+  model = Sequential()
+  model.add(
+    LSTM(
+      units=50, return_sequences=True,
+      input_shape=(X_train.shape[1], X_train.shape[2])
+    )
+  )
+  model.add(LSTM(units=50))
+  model.add(Dense(units=1))
+  model.compile(optimizer='adam', loss='mean_squared_error')
+  model.fit(X_train, y_train, epochs=100, batch_size=64, verbose=1)
+  train_predict = model.predict(X_train)
+  test_predict = model.predict(X_test)
+  train_predict = scaler.inverse_transform(train_predict)
+  y_train = scaler.inverse_transform([y_train])
+  test_predict = scaler.inverse_transform(test_predict)
+  y_test = scaler.inverse_transform([y_test])
+  train_rmse = np.sqrt(mean_squared_error(y_train[0], train_predict[:,0]))
+  test_rmse = np.sqrt(mean_squared_error(y_test[0], test_predict[:,0]))
+  st.write(f"Train RMSE: {train_rmse}")
+  st.write(f"Test RMSE: {test_rmse}")
+  train_predict_plot = np.empty_like(scaled_data)
+  train_predict_plot[:, :] = np.nan
+  train_predict_plot[time_steps:len(train_predict) + time_steps, :] = train_predict
+  test_predict_plot = np.empty_like(scaled_data)
+  test_predict_plot[:, :] = np.nan
+  print(len(train_predict), len(test_predict))
+  #test_predict_plot[len(train_predict) + (time_steps * 2) + 1:len(scaled_data) - 1, :] = test_predict
+  test_predict_plot[len(train_predict) + (time_steps * 2) + 1:len(scaled_data) - 1, :] = test_predict[
+    :len(test_predict_plot) - len(train_predict) - (time_steps * 2) - 1, :
+  ]
+  fig = go.Figure()
+  fig.add_trace(
+    go.Scatter(
+      x=df.index, y=df[target_col].values, mode='lines', name='Actual'
+    )
+  )
+  fig.add_trace(
+    go.Scatter(
+      x=df.index[:len(train_predict_plot)], y=train_predict_plot.flatten(),
+      mode='lines', name='Train Predictions'
+    )
+  )
+  fig.add_trace(
+    go.Scatter(
+      x=df.index[len(train_predict_plot)+1:len(scaled_data)-1], 
+      y=test_predict_plot.flatten(),
+      mode='lines', name='Test Predictions'
+    )
+  )
+  fig.update_layout(
+    title='Actual vs Predicted', xaxis_title='Date',
+    yaxis_title=target_col, height=600, width=1000
+  )
+  st.plotly_chart(fig)
+  return model
 
 
 def ar_train(df):
@@ -139,12 +333,47 @@ def var_train(df):
   st.write("VAR Training has begun.")
 
 
+def sarimax_train(df, target_col, train_size, order, seasonal_order):
+  """ Trains a SARIMAX model and forecasts the time series. """
+  st.write("SARIMA Training has begun.")
+  train_size = int(len(df) * train_size)
+  train, test = df[target_col][:train_size], df[target_col][train_size:]
+  model = SARIMAX(train, order=order, seasonal_order=seasonal_order)
+  model_fit = model.fit(disp=False)
+  st.write(model_fit.summary())
+  forecast = model_fit.forecast(steps=len(test))
+  forecast_index = test.index
+  forecast_series = pd.Series(forecast, index=forecast_index)
+  rmse = np.sqrt(mean_squared_error(test, forecast))
+  st.write(f"Root Mean Squared Error: {rmse}")
+  st.write("Test data:")
+  st.write(test.head())
+  st.write("Forecast data:")
+  st.write(forecast_series.head())
+  fig = go.Figure()
+  fig.add_trace(go.Scatter(
+     x=test.index, y=test, mode='markers', name='Actual',
+     marker=dict(color='red'))
+  )
+  fig.add_trace(
+    go.Scatter(
+      x=forecast_series.index, y=forecast_series,
+      mode='lines', name='Forecast', line=dict(color='blue')
+    )
+  )
+  fig.update_layout(
+    title='Actual vs Forecast',
+    xaxis_title='Datetime',
+    yaxis_title=target_col,
+    height=600,
+    width=1000
+  )
+  st.plotly_chart(fig)
+  return model_fit
+
+
 def sarima_train(df):
   st.write("SARIMA Training has begun.")
-
-
-def sarimax_train(df):
-  st.write("SARIMAX Training has begun.")
 
 
 def lr_train(df, problem, dep, indeps, train_size):
@@ -246,7 +475,6 @@ def peek_data(df):
     st.write(df[showData].head(50))
 
 
-
 def st_time_series_scenario(df):
   """ Builds the page if the data is in time-series format. """
   st.subheader("")
@@ -304,9 +532,16 @@ def st_time_series_scenario(df):
       elif selected_algorithm == "VAR": var_train(df)
       elif selected_algorithm == "Prophet": prophet_train(df)
       elif selected_algorithm == "SARIMA": sarima_train(df)
-      elif selected_algorithm == "Auto ARIMA": auto_arima_train(df)
-      elif selected_algorithm == "SARIMAX": sarimax_train(df)
-      elif selected_algorithm == "LSTM": lstm_train(df)
+      elif selected_algorithm == "Auto ARIMA":
+        auto_arima_train(df, target_col, train_size=train_size)
+      elif selected_algorithm == "SARIMAX":
+        sarimax_train(
+          df, target_col, train_size=train_size,
+          order=(3, 1, 3), seasonal_order=(1, 1, 1, 744)
+        ) # Daily seasonality for hourly data so far, but can change
+        # 1-1-1-24 for daily, 1-1-1-744 for monthly basis, 1-1-1-8760 for yearly
+      elif selected_algorithm == "LSTM":
+        lstm_train(df, target_col=target_col, train_size=train_size)
 
     # Evaluation
     st.write("\n\n")
